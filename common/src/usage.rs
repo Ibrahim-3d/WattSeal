@@ -7,7 +7,7 @@ use chrono::{Datelike, Duration as ChronoDuration, Local, TimeZone};
 use rusqlite::{OptionalExtension, params};
 
 use crate::{
-    Database, DatabaseError, TotalData,
+    Database, DatabaseEntry, DatabaseError, TotalData,
     database::HOUR_MS,
     types::{MICROJOULES_PER_JOULE, SECONDS_PER_HOUR},
 };
