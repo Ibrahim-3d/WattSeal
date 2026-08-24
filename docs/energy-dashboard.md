@@ -29,7 +29,7 @@ Calendar boundaries use the machine's local timezone:
 - **This month**: first day of the local calendar month to now.
 - **Recent average**: up to the most recent seven calendar-day equivalents for which history exists.
 
-WattSeal compacts older one-second `total_data` records into hourly records. A summary interval may therefore start or end in the middle of an hourly record. The aggregation query prorates the record by the portion of its `duration_ms` that overlaps the requested interval:
+WattSeal compacts older one-second `total_data` records into hourly records. A summary interval may therefore start or end in the middle of an hourly record. Calendar-energy queries prorate a record by the portion of its `duration_ms` that overlaps the requested interval:
 
 ```text
 overlap_ms = max(0, min(record_end, range_end) - max(record_start, range_start))
@@ -37,6 +37,8 @@ weighted_energy = record_energy * overlap_ms / record_duration_ms
 ```
 
 This prevents an hourly bucket crossing midnight or a month boundary from being counted wholly on one side of that boundary.
+
+Compacted hourly rows preserve energy accurately but do not preserve whether the collector was active for only part of that hour. For that reason, uptime-dependent metrics use raw/live records only.
 
 ## Metrics
 
@@ -64,6 +66,8 @@ The dashboard shows both energy and cost:
 cost = energy_Wh / 1000 * configured_price_per_kWh
 ```
 
+Today's energy and monitored duration come from un-compacted live records. Month-to-date energy may use both live and compacted records and is therefore suitable for energy/cost totals, not collector-uptime calculations.
+
 ### Recent daily average
 
 The recent energy total is divided by elapsed **calendar time**, not only by WattSeal runtime. This means periods when the computer is off correctly lower the daily-use average once history spans those periods.
@@ -79,14 +83,14 @@ The lookback is capped at seven days. On a new installation, the actual shorter 
 This answers "how much energy does the machine consume during an average hour while WattSeal is actually monitoring it?":
 
 ```text
-average_active_hour_Wh = recent_energy_Wh / monitored_hours
+average_active_hour_Wh = recent_live_energy_Wh / recent_live_monitored_hours
 ```
 
-It intentionally differs from the calendar-hour average because it excludes periods when the collector was not running.
+This calculation uses only raw/live records from up to the last 24 hours. Older compacted hourly rows are deliberately excluded because their fixed one-hour duration cannot distinguish a full monitored hour from a partial one.
 
 ### Monitored today
 
-The monitored duration is the sum of persisted sample durations overlapping today's local calendar interval. It is useful for interpreting a day's energy total when WattSeal was not running continuously.
+The monitored duration is the sum of persisted **live sample durations** overlapping today's local calendar interval. It is useful for interpreting a day's energy total when WattSeal was not running continuously.
 
 ### Monthly projection
 

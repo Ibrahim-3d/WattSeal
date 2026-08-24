@@ -15,6 +15,7 @@ use crate::{
 const MILLIS_PER_SECOND: f64 = 1_000.0;
 const SECONDS_PER_DAY: f64 = 86_400.0;
 const DEFAULT_LOOKBACK_DAYS: i64 = 7;
+const ACTIVE_AVERAGE_LOOKBACK_HOURS: i64 = 24;
 
 /// Energy and cost-ready usage aggregates derived from the persisted total-power history.
 ///
@@ -27,15 +28,14 @@ pub struct UsageSummary {
     pub current_power_w: f64,
     /// Energy recorded since local midnight.
     pub today_energy_wh: f64,
-    /// Time for which WattSeal actually recorded data since local midnight.
+    /// Time for which WattSeal actually recorded live samples since local midnight.
     pub today_monitored_seconds: f64,
     /// Energy recorded since the start of the current local calendar month.
     pub month_energy_wh: f64,
-    /// Time for which WattSeal actually recorded data this month.
-    pub month_monitored_seconds: f64,
     /// Recent energy per calendar day, including periods where the computer was off.
     pub average_daily_energy_wh: f64,
-    /// Recent energy per monitored hour (equivalent to average active power in Wh/h).
+    /// Recent energy per monitored hour, calculated only from raw/live samples so
+    /// compacted hourly buckets cannot overstate monitored time.
     pub average_active_hour_energy_wh: f64,
     /// Forecast for the full current month: actual month-to-date plus recent daily rate
     /// for the remaining calendar time.
@@ -63,8 +63,10 @@ impl RangeUsage {
 impl Database {
     /// Computes dashboard-level energy aggregates from the existing `total_data` table.
     ///
-    /// The query accounts for records that partially overlap a calendar boundary. This
-    /// matters because WattSeal compacts old one-second samples into one-hour records.
+    /// Calendar-energy queries account for records that partially overlap a boundary.
+    /// This matters because WattSeal compacts old one-second samples into one-hour
+    /// records. Active-hour averages intentionally use only un-compacted live samples,
+    /// because an hourly bucket does not preserve partial-hour collector uptime.
     /// No schema migration or duplicate energy store is required.
     pub fn get_usage_summary(&self) -> Result<UsageSummary, DatabaseError> {
         if !self.total_data_table_exists()? {
@@ -91,7 +93,7 @@ impl Database {
             .earliest()
             .ok_or_else(|| DatabaseError::TimeError("Unable to resolve local start of next month".to_string()))?;
 
-        let today = self.usage_between(today_start.timestamp_millis(), now_ms)?;
+        let today = self.live_usage_between(today_start.timestamp_millis(), now_ms)?;
         let month = self.usage_between(month_start.timestamp_millis(), now_ms)?;
 
         let requested_lookback_ms = (now - ChronoDuration::days(DEFAULT_LOOKBACK_DAYS)).timestamp_millis();
@@ -107,9 +109,12 @@ impl Database {
         } else {
             0.0
         };
-        let recent_monitored_hours = recent.monitored_seconds() / SECONDS_PER_HOUR;
-        let average_active_hour_energy_wh = if recent_monitored_hours > 0.0 {
-            recent_energy_wh / recent_monitored_hours
+
+        let active_start_ms = (now - ChronoDuration::hours(ACTIVE_AVERAGE_LOOKBACK_HOURS)).timestamp_millis();
+        let active = self.live_usage_between(active_start_ms, now_ms)?;
+        let active_monitored_hours = active.monitored_seconds() / SECONDS_PER_HOUR;
+        let average_active_hour_energy_wh = if active_monitored_hours > 0.0 {
+            active.energy_wh() / active_monitored_hours
         } else {
             0.0
         };
@@ -125,7 +130,6 @@ impl Database {
             today_energy_wh: today.energy_wh(),
             today_monitored_seconds: today.monitored_seconds(),
             month_energy_wh: month.energy_wh(),
-            month_monitored_seconds: month.monitored_seconds(),
             average_daily_energy_wh,
             average_active_hour_energy_wh,
             projected_month_energy_wh,
@@ -142,12 +146,9 @@ impl Database {
     }
 
     fn first_total_timestamp(&self) -> Result<Option<i64>, DatabaseError> {
-        let value = self
+        Ok(self
             .conn
-            .query_row("SELECT MIN(timestamp) FROM total_data", [], |row| row.get::<_, Option<i64>>(0))
-            .optional()?
-            .flatten();
-        Ok(value)
+            .query_row("SELECT MIN(timestamp) FROM total_data", [], |row| row.get::<_, Option<i64>>(0))?)
     }
 
     fn latest_total_power_w(&self) -> Result<Option<f64>, DatabaseError> {
@@ -171,11 +172,29 @@ impl Database {
     }
 
     fn usage_between(&self, start_ms: i64, end_ms: i64) -> Result<RangeUsage, DatabaseError> {
+        self.query_usage_between(start_ms, end_ms, false)
+    }
+
+    fn live_usage_between(&self, start_ms: i64, end_ms: i64) -> Result<RangeUsage, DatabaseError> {
+        self.query_usage_between(start_ms, end_ms, true)
+    }
+
+    fn query_usage_between(
+        &self,
+        start_ms: i64,
+        end_ms: i64,
+        live_only: bool,
+    ) -> Result<RangeUsage, DatabaseError> {
         if end_ms <= start_ms {
             return Ok(RangeUsage::default());
         }
 
-        let mut stmt = self.conn.prepare(
+        let duration_filter = if live_only {
+            format!("AND duration_ms < {HOUR_MS}")
+        } else {
+            String::new()
+        };
+        let query = format!(
             "SELECT \
                 COALESCE(SUM( \
                     CAST(total_energy_uj AS REAL) * \
@@ -187,13 +206,16 @@ impl Database {
                 ), 0) AS monitored_ms \
              FROM total_data \
              WHERE timestamp < ?2 \
-               AND timestamp + duration_ms > ?1",
-        )?;
+               AND timestamp + duration_ms > ?1 \
+               {duration_filter}"
+        );
 
+        let mut stmt = self.conn.prepare(&query)?;
         let usage = stmt.query_row(params![start_ms, end_ms], |row| {
+            let monitored_ms: i64 = row.get(1)?;
             Ok(RangeUsage {
                 energy_uj: row.get(0)?,
-                monitored_ms: row.get::<_, f64>(1)?,
+                monitored_ms: monitored_ms as f64,
             })
         })?;
         Ok(usage)
