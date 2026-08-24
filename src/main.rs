@@ -5,16 +5,17 @@ use std::{
     process::{Child, Command},
     sync::{Arc, Mutex, mpsc},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use bpaf::{OptionParser, Parser, construct, long, short};
 use collector::{CollectorApp, ConsumptionUnit, MQTTInfo};
 use common::WINDOW_ICON_BYTES;
 use tray_icon::{
-    TrayIconBuilder, TrayIconEvent,
-    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
+    TrayIcon, TrayIconBuilder, TrayIconEvent,
+    menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem},
 };
+use ui::types::ElectricityCost;
 #[cfg(not(target_os = "linux"))]
 use winit::{
     application::ApplicationHandler,
@@ -22,6 +23,8 @@ use winit::{
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     window::WindowId,
 };
+
+const TRAY_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Configuration options for the application.
 #[derive(Debug, Clone)]
@@ -182,47 +185,187 @@ fn load_tray_icon() -> Option<tray_icon::Icon> {
     tray_icon::Icon::from_rgba(img.into_raw(), w, h).ok()
 }
 
-/// Sets up the tray icon menu, event handlers, and builds the tray icon.
-/// Returns `Some(TrayIcon)` on success, `None` if icon loading or tray creation fails.
-fn setup_tray(ui_child: &Arc<Mutex<Option<Child>>>) -> Option<tray_icon::TrayIcon> {
+/// Owns tray UI state on the event-loop thread so labels and check states can be updated safely.
+struct TrayController {
+    icon: TrayIcon,
+    open_ui_item: MenuItem,
+    quit_item: MenuItem,
+    startup_item: CheckMenuItem,
+    power_item: MenuItem,
+    today_item: MenuItem,
+    projection_item: MenuItem,
+    ui_child: Arc<Mutex<Option<Child>>>,
+    last_refresh: Instant,
+}
+
+impl TrayController {
+    fn process_events(&mut self) {
+        while let Ok(event) = MenuEvent::receiver().try_recv() {
+            if &event.id == self.open_ui_item.id() {
+                spawn_ui(&self.ui_child).ok();
+            } else if &event.id == self.quit_item.id() {
+                if let Ok(mut child_guard) = self.ui_child.lock()
+                    && let Some(child) = child_guard.as_mut()
+                {
+                    let _ = child.kill();
+                }
+                std::process::exit(0);
+            } else if &event.id == self.startup_item.id() {
+                self.toggle_startup();
+            }
+        }
+
+        while let Ok(event) = TrayIconEvent::receiver().try_recv() {
+            if let TrayIconEvent::DoubleClick { .. } = event {
+                spawn_ui(&self.ui_child).ok();
+            }
+        }
+    }
+
+    fn toggle_startup(&mut self) {
+        if !common::startup::is_supported() {
+            return;
+        }
+
+        let enable = !common::startup::is_enabled();
+        match common::startup::set_enabled(enable) {
+            Ok(()) => self.startup_item.set_checked(enable),
+            Err(error) => {
+                self.startup_item.set_checked(!enable);
+                common::clog!("✗ Failed to update startup setting: {error}");
+            }
+        }
+    }
+
+    fn refresh_metrics(&mut self, force: bool) {
+        if !force && self.last_refresh.elapsed() < TRAY_REFRESH_INTERVAL {
+            return;
+        }
+        self.last_refresh = Instant::now();
+
+        let database = match common::Database::open_without_migrations() {
+            Ok(database) => database,
+            Err(error) => {
+                common::clog!("✗ Failed to refresh tray metrics: {error}");
+                return;
+            }
+        };
+        let summary = match database.get_usage_summary() {
+            Ok(summary) => summary,
+            Err(error) => {
+                common::clog!("✗ Failed to calculate tray metrics: {error}");
+                return;
+            }
+        };
+        let electricity_cost = database
+            .load_ui_settings()
+            .ok()
+            .flatten()
+            .map(|settings| {
+                ElectricityCost::from_label_and_currency(&settings.kwh_cost, Some(&settings.currency))
+            })
+            .unwrap_or_else(|| ElectricityCost::from_label_and_currency("World average", Some("USD")));
+
+        let current_hour_cost = summary.current_power_w.max(0.0) / 1000.0 * electricity_cost.price_per_kwh;
+        let today_cost = energy_cost(summary.today_energy_wh, electricity_cost);
+        let projected_cost = energy_cost(summary.projected_month_energy_wh, electricity_cost);
+
+        let _ = self.power_item.set_text(format!(
+            "Power now: {:.0} W · {:.2} {}/h",
+            summary.current_power_w.max(0.0),
+            current_hour_cost,
+            electricity_cost.currency_symbol
+        ));
+        let _ = self.today_item.set_text(format!(
+            "Today: {} · {:.2} {}",
+            format_energy_brief(summary.today_energy_wh),
+            today_cost,
+            electricity_cost.currency_symbol
+        ));
+        let _ = self.projection_item.set_text(format!(
+            "Projected month: {} · {:.2} {}",
+            format_energy_brief(summary.projected_month_energy_wh),
+            projected_cost,
+            electricity_cost.currency_symbol
+        ));
+
+        let tooltip = format!(
+            "WattSeal · {:.0} W · Today {} / {:.2} {}",
+            summary.current_power_w.max(0.0),
+            format_energy_brief(summary.today_energy_wh),
+            today_cost,
+            electricity_cost.currency_symbol
+        );
+        let _ = self.icon.set_tooltip(Some(tooltip.as_str()));
+
+        if common::startup::is_supported() {
+            self.startup_item.set_checked(common::startup::is_enabled());
+        }
+    }
+}
+
+fn energy_cost(energy_wh: f64, electricity_cost: ElectricityCost) -> f64 {
+    energy_wh.max(0.0) / 1000.0 * electricity_cost.price_per_kwh.max(0.0)
+}
+
+fn format_energy_brief(energy_wh: f64) -> String {
+    let energy_wh = energy_wh.max(0.0);
+    if energy_wh >= 1000.0 {
+        format!("{:.2} kWh", energy_wh / 1000.0)
+    } else {
+        format!("{:.0} Wh", energy_wh)
+    }
+}
+
+/// Sets up the tray icon, dynamic usage labels, startup toggle, and event state.
+fn setup_tray(ui_child: &Arc<Mutex<Option<Child>>>) -> Option<TrayController> {
     let tray_menu = Menu::new();
-    let open_ui_i = MenuItem::new("Open UI", true, None);
-    let quit_i = MenuItem::new("Quit", true, None);
-    let open_ui_id = open_ui_i.id().to_owned();
-    let quit_id = quit_i.id().to_owned();
+    let power_item = MenuItem::new("Power now: --", false, None);
+    let today_item = MenuItem::new("Today: --", false, None);
+    let projection_item = MenuItem::new("Projected month: --", false, None);
+    let startup_item = CheckMenuItem::new(
+        "Start with Windows (background)",
+        common::startup::is_supported(),
+        common::startup::is_enabled(),
+        None,
+    );
+    let open_ui_item = MenuItem::new("Open UI", true, None);
+    let quit_item = MenuItem::new("Quit", true, None);
 
     tray_menu
-        .append_items(&[&open_ui_i, &PredefinedMenuItem::separator(), &quit_i])
-        .ok();
-
-    let ui_child_menu = Arc::clone(ui_child);
-    MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
-        if event.id == open_ui_id {
-            spawn_ui(&ui_child_menu).ok();
-        } else if event.id == quit_id {
-            if let Ok(mut child_guard) = ui_child_menu.lock() {
-                if let Some(c) = child_guard.as_mut() {
-                    let _ = c.kill();
-                }
-            }
-            std::process::exit(0);
-        }
-    }));
-
-    let ui_child_tray = Arc::clone(ui_child);
-    TrayIconEvent::set_event_handler(Some(move |event| {
-        if let TrayIconEvent::DoubleClick { .. } = event {
-            spawn_ui(&ui_child_tray).ok();
-        }
-    }));
+        .append_items(&[
+            &power_item,
+            &today_item,
+            &projection_item,
+            &PredefinedMenuItem::separator(),
+            &startup_item,
+            &open_ui_item,
+            &PredefinedMenuItem::separator(),
+            &quit_item,
+        ])
+        .ok()?;
 
     let icon = load_tray_icon()?;
-    TrayIconBuilder::new()
+    let icon = TrayIconBuilder::new()
         .with_menu(Box::new(tray_menu))
         .with_tooltip("WattSeal")
         .with_icon(icon)
         .build()
-        .ok()
+        .ok()?;
+
+    let mut controller = TrayController {
+        icon,
+        open_ui_item,
+        quit_item,
+        startup_item,
+        power_item,
+        today_item,
+        projection_item,
+        ui_child: Arc::clone(ui_child),
+        last_refresh: Instant::now() - TRAY_REFRESH_INTERVAL,
+    };
+    controller.refresh_metrics(true);
+    Some(controller)
 }
 
 /// Linux: try to initialise GTK, create the tray icon and run the GTK event loop.
@@ -234,23 +377,25 @@ fn run_linux_tray(ui_child: &Arc<Mutex<Option<Child>>>) -> bool {
         return false;
     }
 
-    let _tray_icon = match setup_tray(ui_child) {
+    let mut tray = match setup_tray(ui_child) {
         Some(t) => t,
         None => return false,
     };
 
-    // Monitor UI child process via GTK periodic callback
+    // Monitor tray events, refresh summary labels, and watch the UI subprocess locally.
     let ui_child_watcher = Arc::clone(ui_child);
     gtk::glib::timeout_add_local(Duration::from_millis(250), move || {
-        if let Ok(mut guard) = ui_child_watcher.lock() {
-            if let Some(child) = guard.as_mut() {
-                if let Ok(Some(status)) = child.try_wait() {
-                    let code = status.code().unwrap_or(0);
-                    *guard = None;
-                    if code == common::EXIT_CODE_SHUTDOWN_ALL {
-                        std::process::exit(0);
-                    }
-                }
+        tray.process_events();
+        tray.refresh_metrics(false);
+
+        if let Ok(mut guard) = ui_child_watcher.lock()
+            && let Some(child) = guard.as_mut()
+            && let Ok(Some(status)) = child.try_wait()
+        {
+            let code = status.code().unwrap_or(0);
+            *guard = None;
+            if code == common::EXIT_CODE_SHUTDOWN_ALL {
+                std::process::exit(0);
             }
         }
         gtk::glib::ControlFlow::Continue
@@ -389,42 +534,51 @@ fn main() {
             }
         };
 
-        let _tray_icon = setup_tray(&ui_child);
-
+        let tray = setup_tray(&ui_child);
         let ui_child_watcher = Arc::clone(&ui_child);
-        thread::spawn(move || {
-            loop {
-                thread::sleep(Duration::from_millis(250));
-                let mut guard = match ui_child_watcher.lock() {
-                    Ok(g) => g,
-                    Err(e) => {
-                        common::clog!("✗ Failed to lock UI child mutex: {}", e);
-                        continue;
-                    }
-                };
-                if let Some(child) = guard.as_mut() {
-                    match child.try_wait() {
-                        Ok(Some(status)) => {
-                            let code = status.code().unwrap_or(0);
-                            *guard = None;
-                            if code == common::EXIT_CODE_SHUTDOWN_ALL {
-                                std::process::exit(0);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        });
 
-        struct TrayApp;
+        struct TrayApp {
+            tray: Option<TrayController>,
+            ui_child: Arc<Mutex<Option<Child>>>,
+        }
+
         impl ApplicationHandler for TrayApp {
             fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-                event_loop.set_control_flow(ControlFlow::Wait);
+                event_loop.set_control_flow(ControlFlow::WaitUntil(
+                    Instant::now() + Duration::from_millis(250),
+                ));
             }
+
+            fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+                if let Some(tray) = self.tray.as_mut() {
+                    tray.process_events();
+                    tray.refresh_metrics(false);
+                }
+
+                if let Ok(mut guard) = self.ui_child.lock()
+                    && let Some(child) = guard.as_mut()
+                    && let Ok(Some(status)) = child.try_wait()
+                {
+                    let code = status.code().unwrap_or(0);
+                    *guard = None;
+                    if code == common::EXIT_CODE_SHUTDOWN_ALL {
+                        std::process::exit(0);
+                    }
+                }
+
+                event_loop.set_control_flow(ControlFlow::WaitUntil(
+                    Instant::now() + Duration::from_millis(250),
+                ));
+            }
+
             fn window_event(&mut self, _event_loop: &ActiveEventLoop, _id: WindowId, _event: WindowEvent) {}
         }
-        event_loop.run_app(&mut TrayApp).ok();
+
+        let mut tray_app = TrayApp {
+            tray,
+            ui_child: ui_child_watcher,
+        };
+        event_loop.run_app(&mut tray_app).ok();
     }
 
     // Linux: try tray with GTK, fall back to simple monitoring

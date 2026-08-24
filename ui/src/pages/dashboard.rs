@@ -1,6 +1,8 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
-use common::{AllTimeData, DatabaseEntry, ProcessData, TotalData};
+use common::{
+    AllTimeData, DatabaseEntry, ProcessData, TotalData, UsageSummary, usage::cached_usage_summary,
+};
 use iced::{
     Alignment, Element, Length, Padding,
     alignment::{Horizontal, Vertical},
@@ -15,8 +17,8 @@ use crate::{
         container::ContainerStyle,
         scrollable::ScrollableStyle,
         style_constants::{
-            FONT_BOLD, FONT_SIZE_BODY, FONT_SIZE_LARGE, FONT_SIZE_SUBTITLE, FONT_SIZE_TITLE, PADDING_LARGE,
-            PADDING_MEDIUM, SPACING_LARGE, SPACING_SMALL, SPACING_XLARGE,
+            FONT_BOLD, FONT_SIZE_BODY, FONT_SIZE_LARGE, FONT_SIZE_SMALL, FONT_SIZE_SUBTITLE, FONT_SIZE_TITLE,
+            PADDING_LARGE, PADDING_MEDIUM, SPACING_LARGE, SPACING_SMALL, SPACING_XLARGE,
         },
         text::TextStyle,
     },
@@ -28,7 +30,9 @@ use crate::{
     types::{AppLanguage, CarbonIntensity, ElectricityCost},
 };
 
-/// Dashboard page showing total power, charts, and process summary.
+const SUMMARY_CACHE_AGE: Duration = Duration::from_secs(5);
+
+/// Dashboard page showing current power, calendar energy summaries, charts, and process details.
 pub struct DashboardPage;
 
 impl DashboardPage {
@@ -40,12 +44,15 @@ impl DashboardPage {
         carbon_intensity: CarbonIntensity,
         electricity_cost: ElectricityCost,
     ) -> Element<'a, Message, AppTheme> {
+        let usage = cached_usage_summary(SUMMARY_CACHE_AGE);
+
         let content = Column::new()
-            .spacing(SPACING_XLARGE)
+            .spacing(SPACING_LARGE)
             .padding(Padding::from(PADDING_LARGE))
             .width(Length::Fill)
             .height(Length::Fill)
-            .push(self.view_power_summary(sensors, all_time_data, language, carbon_intensity, electricity_cost));
+            .push(self.view_power_summary(sensors, all_time_data, language, carbon_intensity, electricity_cost))
+            .push(self.view_calendar_summary(&usage, language, carbon_intensity, electricity_cost));
 
         let additional_content = Column::new()
             .spacing(SPACING_XLARGE)
@@ -81,6 +88,7 @@ impl DashboardPage {
             .map(|energy| energy.as_watts_for_seconds(1.0))
             .unwrap_or(0.0);
         let power_value = format_number(raw_power, 1, language);
+        let current_cost_per_hour = raw_power / 1000.0 * electricity_cost.price_per_kwh;
 
         let main = Column::new()
             .width(Length::FillPortion(1))
@@ -103,6 +111,16 @@ impl DashboardPage {
                             .class(TextStyle::Primary),
                     )
                     .push(Text::new("W").size(FONT_SIZE_TITLE).class(TextStyle::Muted)),
+            )
+            .push(
+                Text::new(format!(
+                    "≈ {} {} / {}",
+                    format_number(current_cost_per_hour.max(0.0), 2, language),
+                    electricity_cost.currency_symbol,
+                    hour_label(language)
+                ))
+                .size(FONT_SIZE_BODY)
+                .class(TextStyle::Muted),
             );
 
         let total_energy_wh = all_time_data
@@ -135,7 +153,6 @@ impl DashboardPage {
                         energy_unit,
                         TextStyle::Secondary,
                     ))
-                    // space for help button alignment
                     .push(Text::new(" ").size(FONT_SIZE_BODY).width(Length::Fixed(24.0))),
             )
             .push(
@@ -189,6 +206,106 @@ impl DashboardPage {
             .padding(Padding::from(PADDING_MEDIUM))
             .class(ContainerStyle::PowerCard)
             .into()
+    }
+
+    fn view_calendar_summary<'a>(
+        &'a self,
+        usage: &UsageSummary,
+        language: AppLanguage,
+        carbon_intensity: CarbonIntensity,
+        electricity_cost: ElectricityCost,
+    ) -> Element<'a, Message, AppTheme> {
+        let today_cost = cost_for_energy(usage.today_energy_wh, electricity_cost);
+        let month_cost = cost_for_energy(usage.month_energy_wh, electricity_cost);
+        let projected_cost = cost_for_energy(usage.projected_month_energy_wh, electricity_cost);
+        let daily_cost = cost_for_energy(usage.average_daily_energy_wh, electricity_cost);
+        let active_hour_cost = cost_for_energy(usage.average_active_hour_energy_wh, electricity_cost);
+
+        let top_row = Row::new()
+            .spacing(SPACING_LARGE)
+            .width(Length::Fill)
+            .push(summary_tile(
+                today_label(language),
+                usage.today_energy_wh,
+                today_cost,
+                electricity_cost,
+                language,
+                TextStyle::Secondary,
+            ))
+            .push(summary_tile(
+                this_month_label(language),
+                usage.month_energy_wh,
+                month_cost,
+                electricity_cost,
+                language,
+                TextStyle::Secondary,
+            ))
+            .push(summary_tile(
+                projected_month_label(language),
+                usage.projected_month_energy_wh,
+                projected_cost,
+                electricity_cost,
+                language,
+                TextStyle::Primary,
+            ));
+
+        let today_co2 = wh_to_co2_grams(usage.today_energy_wh, carbon_intensity.g_per_kwh);
+        let (co2_value, co2_unit) = format_emissions(today_co2, language);
+        let basis_days = format_number(usage.projection_basis_days, 1, language);
+
+        let bottom_row = Row::new()
+            .spacing(SPACING_LARGE)
+            .width(Length::Fill)
+            .push(summary_tile(
+                recent_daily_average_label(language),
+                usage.average_daily_energy_wh,
+                daily_cost,
+                electricity_cost,
+                language,
+                TextStyle::Secondary,
+            ))
+            .push(summary_tile(
+                average_active_hour_label(language),
+                usage.average_active_hour_energy_wh,
+                active_hour_cost,
+                electricity_cost,
+                language,
+                TextStyle::Secondary,
+            ))
+            .push(
+                Container::new(
+                    Column::new()
+                        .spacing(SPACING_SMALL)
+                        .align_x(Alignment::Center)
+                        .push(
+                            Text::new(monitored_today_label(language))
+                                .size(FONT_SIZE_BODY)
+                                .font(FONT_BOLD)
+                                .class(TextStyle::Subtitle),
+                        )
+                        .push(
+                            Text::new(format_duration(usage.today_monitored_seconds))
+                                .size(FONT_SIZE_SUBTITLE)
+                                .font(FONT_BOLD)
+                                .class(TextStyle::Primary),
+                        )
+                        .push(
+                            Text::new(format!("{} {} {}", co2_value, co2_unit, emissions_today_suffix(language)))
+                                .size(FONT_SIZE_SMALL)
+                                .class(TextStyle::Muted),
+                        )
+                        .push(
+                            Text::new(format!("{} {}", basis_days, projection_basis_suffix(language)))
+                                .size(FONT_SIZE_SMALL)
+                                .class(TextStyle::Muted),
+                        ),
+                )
+                .width(Length::FillPortion(1))
+                .padding(Padding::from(PADDING_MEDIUM))
+                .class(ContainerStyle::Card),
+            );
+
+        Column::new().spacing(SPACING_LARGE).push(top_row).push(bottom_row).into()
     }
 
     fn view_process_summary<'a>(
@@ -317,6 +434,137 @@ fn metric_tile<'a>(
     .into()
 }
 
+fn summary_tile<'a>(
+    label: &'a str,
+    energy_wh: f64,
+    cost: f64,
+    electricity_cost: ElectricityCost,
+    language: AppLanguage,
+    value_style: TextStyle,
+) -> Element<'a, Message, AppTheme> {
+    let (energy_value, energy_unit) = format_energy(energy_wh.max(0.0), language);
+    let cost_value = format_number(cost.max(0.0), 2, language);
+
+    Container::new(
+        Column::new()
+            .spacing(SPACING_SMALL)
+            .align_x(Alignment::Center)
+            .push(
+                Text::new(label)
+                    .size(FONT_SIZE_BODY)
+                    .font(FONT_BOLD)
+                    .class(TextStyle::Subtitle),
+            )
+            .push(
+                Text::new(format!("{} {}", energy_value, energy_unit))
+                    .size(FONT_SIZE_SUBTITLE)
+                    .font(FONT_BOLD)
+                    .class(value_style),
+            )
+            .push(
+                Text::new(format!("{} {}", cost_value, electricity_cost.currency_symbol))
+                    .size(FONT_SIZE_BODY)
+                    .class(TextStyle::Muted),
+            ),
+    )
+    .width(Length::FillPortion(1))
+    .padding(Padding::from(PADDING_MEDIUM))
+    .class(ContainerStyle::Card)
+    .into()
+}
+
+fn cost_for_energy(energy_wh: f64, electricity_cost: ElectricityCost) -> f64 {
+    energy_wh.max(0.0) / 1000.0 * electricity_cost.price_per_kwh.max(0.0)
+}
+
 fn wh_to_co2_grams(energy_wh: f64, intensity_g_per_kwh: f64) -> f64 {
     (energy_wh / 1000.0) * intensity_g_per_kwh
+}
+
+fn format_duration(seconds: f64) -> String {
+    let total_minutes = (seconds.max(0.0) / 60.0).floor() as u64;
+    let hours = total_minutes / 60;
+    let minutes = total_minutes % 60;
+    format!("{}h {:02}m", hours, minutes)
+}
+
+fn hour_label(language: AppLanguage) -> &'static str {
+    match language {
+        AppLanguage::English => "hour",
+        AppLanguage::French => "heure",
+        AppLanguage::Chinese => "小时",
+        AppLanguage::Romanian => "oră",
+    }
+}
+
+fn today_label(language: AppLanguage) -> &'static str {
+    match language {
+        AppLanguage::English => "Today",
+        AppLanguage::French => "Aujourd’hui",
+        AppLanguage::Chinese => "今天",
+        AppLanguage::Romanian => "Astăzi",
+    }
+}
+
+fn this_month_label(language: AppLanguage) -> &'static str {
+    match language {
+        AppLanguage::English => "This month",
+        AppLanguage::French => "Ce mois-ci",
+        AppLanguage::Chinese => "本月",
+        AppLanguage::Romanian => "Luna aceasta",
+    }
+}
+
+fn projected_month_label(language: AppLanguage) -> &'static str {
+    match language {
+        AppLanguage::English => "Projected month",
+        AppLanguage::French => "Projection mensuelle",
+        AppLanguage::Chinese => "月度预测",
+        AppLanguage::Romanian => "Proiecție lunară",
+    }
+}
+
+fn recent_daily_average_label(language: AppLanguage) -> &'static str {
+    match language {
+        AppLanguage::English => "Recent daily average",
+        AppLanguage::French => "Moyenne quotidienne récente",
+        AppLanguage::Chinese => "近期日均",
+        AppLanguage::Romanian => "Media zilnică recentă",
+    }
+}
+
+fn average_active_hour_label(language: AppLanguage) -> &'static str {
+    match language {
+        AppLanguage::English => "Average active hour",
+        AppLanguage::French => "Heure active moyenne",
+        AppLanguage::Chinese => "平均运行小时",
+        AppLanguage::Romanian => "Oră activă medie",
+    }
+}
+
+fn monitored_today_label(language: AppLanguage) -> &'static str {
+    match language {
+        AppLanguage::English => "Monitored today",
+        AppLanguage::French => "Suivi aujourd’hui",
+        AppLanguage::Chinese => "今日监测时长",
+        AppLanguage::Romanian => "Monitorizat astăzi",
+    }
+}
+
+fn emissions_today_suffix(language: AppLanguage) -> &'static str {
+    match language {
+        AppLanguage::English => "CO₂ today",
+        AppLanguage::French => "CO₂ aujourd’hui",
+        AppLanguage::Chinese => "今日 CO₂",
+        AppLanguage::Romanian => "CO₂ astăzi",
+    }
+}
+
+fn projection_basis_suffix(language: AppLanguage) -> &'static str {
+    match language {
+        AppLanguage::English => "days of history",
+        AppLanguage::French => "jours d’historique",
+        AppLanguage::Chinese => "天历史数据",
+        AppLanguage::Romanian => "zile de istoric",
+    }
 }

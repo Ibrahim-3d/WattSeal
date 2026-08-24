@@ -1,7 +1,9 @@
 pub mod database;
 pub mod logging;
 pub mod singleton;
+pub mod startup;
 pub mod types;
+pub mod usage;
 pub mod utils;
 
 /// In debug → `println!`. In release → append timestamped line to log file.
@@ -22,6 +24,7 @@ pub use types::{
     LabeledValue, MICROJOULES_PER_JOULE, MetricKind, NetworkData, ProcessData, RamData, SECONDS_PER_HOUR,
     SecondaryValues, SensorData, TotalData,
 };
+pub use usage::UsageSummary;
 pub use utils::set_current_dir_to_exe_dir;
 
 /// Exit code the UI subprocess uses to signal "stop the collector too".
